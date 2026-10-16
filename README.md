@@ -66,35 +66,53 @@ Routing rule:
 ## 2. Architecture
 
 ```mermaid
-flowchart TD
-    subgraph Ingestion
-        D[Directory of txt, md, pdf] --> M{Manifest check<br/>mtime and size}
-        M -->|unchanged| SKIP[Skip file]
-        M -->|new or changed| PW[Process pool, spawn<br/>load, split, hash ids, dedupe]
-        PW --> EMB[bge-m3 embeddings<br/>GPU fp16, batched]
-        EMB --> VS[(ChromaDB<br/>HNSW cosine)]
-        EMB --> MAN[Atomic manifest write]
+graph TD
+    subgraph Phase1["1. Temporal Context & Intent Routing"]
+        A[User Query] --> B[Temporal Context Injector<br/><i>Calculates Epoch & Human Delta</i>]
+        B --> C{Adaptive-RAG Router<br/><i>Jeong et al.</i>}
     end
 
-    subgraph Query
-        Q[User query] --> RET[Retrieve top-k]
-        VS --> RET
-        RET --> GR[Batched LLM grader<br/>scores plus search query]
-        GR --> T1[Tier 1: chunk rejection<br/>drop below 0.3, rank, cap 8]
-        GR --> RT{Tier 3: router}
-        T1 --> RL[Tier 2: sentence refinement<br/>local]
-        RT -->|CORRECT| RL
-        RT -->|AMBIGUOUS| RL
-        RT -->|AMBIGUOUS| WEB[Web search<br/>DuckDuckGo, Tavily fallback]
-        RT -->|INCORRECT| WEB
-        WEB --> RW[Tier 2: sentence refinement<br/>web]
-        WEB -->|empty| CB[Circuit breaker<br/>notice or parametric fallback]
-        RL --> CTX[Context blocks]
-        RW --> CTX
-        CB --> CTX
-        CTX --> GEN[Generator<br/>streamed, injection-hardened prompt]
-        GEN --> OUT[Answer, sources, trace]
+    subgraph Phase2["2. Query Expansion & Hybrid Retrieval"]
+        C -->|Knowledge Needed| D[Query Rewriter & HyDE<br/><i>Ma et al.</i>]
+        D --> E[Hybrid Search Engine<br/><i>Lewis et al.</i>]
+        E1[(ChromaDB Dense)] -->|Cosine Sim| E
+        E2[BM25 Sparse] -->|Keyword Rank| E
+        E --> F[Reciprocal Rank Fusion - RRF]
     end
+
+    subgraph Phase3["3. Corrective Filtering & Compression"]
+        F --> G{CRAG Evaluator<br/><i>Yan et al.</i>}
+        G -->|High Confidence| H[RECOMP Context Compressor<br/><i>Xu et al.</i>]
+        G -->|Low Confidence| I[Web Search Fallback<br/><i>DuckDuckGo / Tavily</i>]
+        G -->|Ambiguous| J[Blend Local + Web Chunks]
+        I --> H
+        J --> H
+    end
+
+    subgraph Phase4["4. Positional Packing & Generation"]
+        C -->|Direct Reply| K[Prompt Context Builder]
+        H --> L[Lost-in-the-Middle Packer<br/><i>Liu et al.</i>]
+        L -->|Head & Tail Priority| K
+        K --> M[llama-server: Gemma 4<br/><i>FLARE Active Retrieval - Jiang et al.</i>]
+        M -->|Text Stream| N[CosyVoice2 FP16 Process<br/><i>GPU Acceleration</i>]
+        M -->|Self-RAG Critique - Asai et al.| O{Output Valid?}
+        O -->|Pass| P[Audio Output to User]
+        O -->|Fail| D
+    end
+
+    subgraph Phase5["5. Dual-Write Memory Logging"]
+        M -->|Turn Complete| Q[Dual-Write Memory Controller]
+        Q -->|Primary / Fast Path| R>Zero-VRAM, Instant, Non-Lossy</i>]
+        Q -->|Secondary / Async Path| S[Visual Canvas Generator<br/><i>PNG/TIFF Optical Compression Archive</i>]
+    end
+
+    style A fill:#0f172a,stroke:#38bdf8,stroke-width:2px,color:#fff
+    style B fill:#1e293b,stroke:#38bdf8,stroke-width:1px,color:#fff
+    style C fill:#1e293b,stroke:#38bdf8,stroke-width:1px,color:#fff
+    style M fill:#1e1b4b,stroke:#818cf8,stroke-width:2px,color:#fff
+    style N fill:#311042,stroke:#c084fc,stroke-width:2px,color:#fff
+    style R fill:#064e3b,stroke:#34d399,stroke-width:2px,color:#fff
+    style S fill:#701a75,stroke:#f472b6,stroke-width:2px,color:#fff
 ```
 
 Four modules, one responsibility each:
