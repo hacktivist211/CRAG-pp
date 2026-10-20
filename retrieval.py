@@ -1,8 +1,9 @@
 import hashlib
 import json
+import math
 import os
+import re
 import sys
-os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 import time
 from concurrent.futures import (
     FIRST_COMPLETED,
@@ -28,14 +29,13 @@ try:
 except ImportError:
     RICH_AVAILABLE = False
 
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 
-EMBEDDING_MODEL_NAME = "BAAI/bge-m3"
-PERSIST_DIRECTORY = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "crag_vector_store"
-)
+EMBEDDING_MODEL_NAME = os.getenv("CRAG_EMBED_MODEL", "BAAI/bge-m3")
+PERSIST_DIRECTORY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crag_vector_store")
 COLLECTION_NAME = "crag_knowledge"
-CHUNK_SIZE = 800
-CHUNK_OVERLAP = 150
+CHUNK_SIZE = 950
+CHUNK_OVERLAP = 159
 SUPPORTED_EXTENSIONS = (".txt", ".md", ".pdf")
 WRITE_BATCH_SIZE = 500
 DELETE_BATCH_SIZE = 5000
@@ -49,6 +49,28 @@ try:
     EMBED_BATCH = max(8, int(os.getenv("CRAG_EMBED_BATCH", "64")))
 except ValueError:
     EMBED_BATCH = 64
+
+# Hybrid retrieval: a bm25 sparse side index over every stored chunk is fused
+# with the dense hnsw results through reciprocal rank fusion. This rescues
+# exact-keyword lookups (names, error codes, ids) that embeddings can miss.
+try:
+    HYBRID_RETRIEVAL = os.getenv("CRAG_HYBRID_RETRIEVAL", "1").strip().lower() not in (
+        "0", "false", "off", "no",
+    )
+except Exception:
+    HYBRID_RETRIEVAL = True
+try:
+    BM25_K1 = float(os.getenv("CRAG_BM25_K1", "1.5"))
+except ValueError:
+    BM25_K1 = 1.5
+try:
+    BM25_B = float(os.getenv("CRAG_BM25_B", "0.75"))
+except ValueError:
+    BM25_B = 0.75
+BM25_MAX_DOCS = 20000
+RRF_K = 60
+SPARSE_CANDIDATE_FACTOR = 3
+_BM25_TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 INDEX_METADATA = {
     "hnsw:space": "cosine",
@@ -133,9 +155,7 @@ class _PlainProgress:
         bar_width = 30
         filled = int(bar_width * ratio)
         bar = "#" * filled + "-" * (bar_width - filled)
-        sys.stdout.write(
-            f"\r[ingest] {task['description']} [{bar}] {done}/{total}   "
-        )
+        sys.stdout.write(f"\r[ingest] {task['description']} [{bar}] {done}/{total}   ")
         sys.stdout.flush()
         if finished:
             sys.stdout.write("\n")
@@ -197,14 +217,47 @@ class GpuEmbeddings(Embeddings):
     def warmup(self):
         self._load()
 
+    def ensure_gpu(self):
+        if self._model is None:
+            return
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return
+            device = str(next(self._model.parameters()).device)
+            if not device.startswith("cuda"):
+                self._model.to("cuda")
+        except Exception:
+            pass
+
+    def release_gpu(self):
+        if self._model is None:
+            return
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return
+            device = str(next(self._model.parameters()).device)
+            if device.startswith("cuda"):
+                self._model.to("cpu")
+                torch.cuda.empty_cache()
+                print("[embeddings] model moved to cpu, vram released for other models")
+        except Exception:
+            pass
+
     def _load(self):
         if self._model is not None:
             return self._model
         import torch
         from sentence_transformers import SentenceTransformer
 
+        # Default is CPU: the primary IRIS runtime (llama-server + Kokoro TTS)
+        # owns the 6 GB GPU, and this index is shared with it. To use the GPU
+        # for embedding sessions with the LLM server stopped, set
+        # CRAG_EMBED_DEVICE=cuda. Changing the device never invalidates the
+        # stored vectors (bge-m3 embedding space is device-independent).
         requested = os.getenv("CRAG_EMBED_DEVICE")
-        device = requested or ("cuda" if torch.cuda.is_available() else "cpu")
+        device = requested or "cpu"
         fp16 = device == "cuda"
         attempts = []
         if fp16:
@@ -225,7 +278,7 @@ class GpuEmbeddings(Embeddings):
                     text = str(error)
                     if "torch.load" in text or "32434" in text:
                         raise RuntimeError(
-                            "bge-m3 weights are pytorch_model.bin and torch < 2.6 refuses "
+                            "embedding weights are pytorch_model.bin and torch < 2.6 refuses "
                             "to load them (CVE-2025-32434). Fix: pip install --upgrade torch"
                         ) from error
                     errors.append(error)
@@ -287,6 +340,37 @@ def get_splitter():
             separators=["\n\n", "\n", ". ", " ", ""],
         )
     return _text_splitter
+
+
+def _bm25_tokens(text):
+    """Lowercase alphanumeric tokens; single letters are dropped, digits kept."""
+    tokens = _BM25_TOKEN_RE.findall((text or "").lower())
+    return [token for token in tokens if len(token) > 1 or token.isdigit()]
+
+
+def reciprocal_rank_fusion(dense_chunks, sparse_chunks, k):
+    """Fuse dense (cosine) and sparse (bm25) result lists with reciprocal rank fusion.
+
+    Both inputs must already be ordered best-first. Chunks are keyed by text, so
+    a chunk found by both retrievers accumulates score and floats to the top,
+    while a strong keyword-only hit can still displace a weak dense hit.
+    """
+    fused_scores = {}
+    fused_chunks = {}
+    for ranking, chunk in enumerate(dense_chunks or []):
+        key = chunk.get("text", "")
+        if key not in fused_chunks:
+            fused_chunks[key] = chunk
+            fused_scores[key] = 0.0
+        fused_scores[key] += 1.0 / (RRF_K + ranking + 1)
+    for ranking, chunk in enumerate(sparse_chunks or []):
+        key = chunk.get("text", "")
+        if key not in fused_chunks:
+            fused_chunks[key] = chunk
+            fused_scores[key] = 0.0
+        fused_scores[key] += 1.0 / (RRF_K + ranking + 1)
+    ranked_keys = sorted(fused_scores, key=fused_scores.get, reverse=True)
+    return [fused_chunks[key] for key in ranked_keys[: max(0, int(k))]]
 
 
 def _discover_documents(directory):
@@ -366,6 +450,7 @@ def _process_file_worker(path, manifest_snapshot, splitter):
             }
         )
         ids.append(chunk_id)
+
     if not texts:
         return {"path": path, "basename": basename, "status": "empty"}
 
@@ -399,6 +484,8 @@ class VectorEngine:
         self.embeddings = get_embeddings()
         self.store = self._create_store(collection_name, persist_directory, drop_old)
         self.splitter = get_splitter()
+        self._dimension_checked = False
+        self._bm25_state = None
 
     def _create_store(self, collection_name, persist_directory, drop_old):
         import logging
@@ -418,6 +505,38 @@ class VectorEngine:
             collection_metadata=dict(INDEX_METADATA),
             client_settings=Settings(anonymized_telemetry=False),
         )
+
+    def _verify_embedding_dimension(self):
+        if self._dimension_checked:
+            return
+        self._dimension_checked = True
+        try:
+            count = int(self.store._collection.count())
+        except Exception:
+            return
+        if count == 0:
+            return
+        collection_dimension = None
+        try:
+            collection_dimension = int(self.store._collection.dimension)
+        except Exception:
+            try:
+                peek = self.store._collection.get(limit=1, include=["embeddings"])
+                embeddings = peek.get("embeddings") if isinstance(peek, dict) else None
+                if embeddings:
+                    collection_dimension = len(embeddings[0])
+            except Exception:
+                pass
+        if not collection_dimension:
+            return
+        probe = self.embeddings.embed_query("dimension probe")
+        if len(probe) != collection_dimension:
+            raise RuntimeError(
+                f"embedding model mismatch: the store holds {collection_dimension}-dimensional vectors "
+                f"but {EMBEDDING_MODEL_NAME} produces {len(probe)} dimensions. "
+                "run: python main.py --reset  then re-ingest the directory"
+            )
+
     def _apply_search_ef(self, ef):
         try:
             ef = max(16, int(ef))
@@ -465,9 +584,7 @@ class VectorEngine:
             return int(self.store._collection.count())
         except Exception:
             manifest = self._load_manifest()
-            return sum(
-                len(entry.get("ids", [])) for entry in manifest["files"].values()
-            )
+            return sum(len(entry.get("ids", [])) for entry in manifest["files"].values())
 
     @staticmethod
     def _looks_pdf_heavy(files):
@@ -482,6 +599,12 @@ class VectorEngine:
         )
         if not os.path.isdir(directory):
             print(f"[ingest] not a directory: {directory}")
+            return {"added": 0, "updated": 0, "skipped": 0, "removed": 0, "total": 0}
+
+        try:
+            self._verify_embedding_dimension()
+        except RuntimeError as error:
+            print(f"[ingest] {error}")
             return {"added": 0, "updated": 0, "skipped": 0, "removed": 0, "total": 0}
 
         _check_text_encoding_support()
@@ -528,11 +651,10 @@ class VectorEngine:
             executor_kwargs["mp_context"] = multiprocessing.get_context("spawn")
         else:
             executor_kwargs["thread_name_prefix"] = "crag-ingest"
-        executor_cls = (
-            ProcessPoolExecutor if self.pool_kind == "process" else ThreadPoolExecutor
-        )
+        executor_cls = ProcessPoolExecutor if self.pool_kind == "process" else ThreadPoolExecutor
 
         print("[embeddings] warming up the model (first run also builds the CUDA kernels)...")
+        self.embeddings.ensure_gpu()
         try:
             self.embeddings.warmup()
         except Exception as error:
@@ -584,23 +706,16 @@ class VectorEngine:
                             if status == "unchanged":
                                 skipped += 1
                                 progress.advance(files_task)
-                                progress.update(
-                                    files_task, description=f"unchanged: {short_name}"
-                                )
+                                progress.update(files_task, description=f"unchanged: {short_name}")
                                 continue
 
                             if status == "unreadable":
-                                _progress_print(
-                                    progress, f"unreadable file skipped: {basename}"
-                                )
+                                _progress_print(progress, f"unreadable file skipped: {basename}")
                                 progress.advance(files_task)
                                 continue
 
                             if status == "failed":
-                                _progress_print(
-                                    progress,
-                                    f"failed to read {basename}: {result['error']}",
-                                )
+                                _progress_print(progress, f"failed to read {basename}: {result['error']}")
                                 progress.advance(files_task)
                                 continue
 
@@ -611,9 +726,7 @@ class VectorEngine:
                                     existing.pop(path, None)
                                     self._save_manifest(manifest)
                                 progress.advance(files_task)
-                                progress.update(
-                                    files_task, description=f"empty: {short_name}"
-                                )
+                                progress.update(files_task, description=f"empty: {short_name}")
                                 continue
 
                             texts = result["texts"]
@@ -652,10 +765,7 @@ class VectorEngine:
                             except Exception as error:
                                 failed = True
                                 self._delete_ids(written)
-                                _progress_print(
-                                    progress,
-                                    f"embedding failed for {basename}: {error}",
-                                )
+                                _progress_print(progress, f"embedding failed for {basename}: {error}")
                             finally:
                                 self.embeddings.set_progress(None)
                                 progress.remove_task(embed_task)
@@ -690,6 +800,8 @@ class VectorEngine:
             print(f"\n[ingest] ingestion stopped by an error: {error}")
 
         self._save_manifest(manifest)
+        if os.getenv("CRAG_KEEP_EMBED_ON_GPU", "0").lower() not in ("1", "true", "yes"):
+            self.embeddings.release_gpu()
 
         status = " (interrupted)" if interrupted else ""
         print(
@@ -710,9 +822,7 @@ class VectorEngine:
             "total": len(files),
         }
 
-    def retrieve(self, query, k=4, ef=None):
-        if ef is not None:
-            self._apply_search_ef(ef)
+    def _dense_search(self, query, k):
         results = self.store.similarity_search_with_score(query, k=k)
         chunks = []
         for document, distance in results:
@@ -725,3 +835,104 @@ class VectorEngine:
                 }
             )
         return chunks
+
+    def _bm25_index(self):
+        """Lazily build and cache a bm25 side index over every stored chunk.
+
+        The cache rebuilds automatically whenever the chunk count changes, so
+        ingestion refreshes it with no extra wiring. Returns None when hybrid
+        retrieval is off, the store is empty, or the corpus is too large.
+        """
+        if not HYBRID_RETRIEVAL:
+            return None
+        try:
+            count = self.chunk_count()
+        except Exception:
+            return None
+        if count <= 0 or count > BM25_MAX_DOCS:
+            return None
+        if self._bm25_state and self._bm25_state[0] == count:
+            return self._bm25_state
+        try:
+            fetch = self.store._collection.get(include=["documents", "metadatas"])
+            documents = list(fetch.get("documents") or [])
+            metadatas = list(fetch.get("metadatas") or [])
+            token_lists = [_bm25_tokens(document) for document in documents]
+            document_frequency = {}
+            for tokens in token_lists:
+                for token in set(tokens):
+                    document_frequency[token] = document_frequency.get(token, 0) + 1
+            total_length = sum(len(tokens) for tokens in token_lists)
+            average_length = (total_length / len(token_lists)) if token_lists else 1.0
+            self._bm25_state = (
+                count,
+                documents,
+                metadatas,
+                token_lists,
+                document_frequency,
+                max(average_length, 1e-6),
+            )
+            print(f"[crag] bm25 side index built over {len(documents)} chunk(s) for hybrid retrieval")
+        except Exception:
+            self._bm25_state = None
+        return self._bm25_state
+
+    def _bm25_search(self, query, limit):
+        state = self._bm25_index()
+        if not state:
+            return []
+        _count, documents, metadatas, token_lists, document_frequency, average_length = state
+        terms = set(_bm25_tokens(query))
+        if not terms:
+            return []
+        corpus_size = len(token_lists)
+        scored = []
+        for index, tokens in enumerate(token_lists):
+            if not tokens:
+                continue
+            length = len(tokens)
+            score = 0.0
+            for term in terms:
+                frequency = tokens.count(term)
+                if not frequency:
+                    continue
+                document_count = document_frequency.get(term, 0)
+                idf = math.log(1.0 + (corpus_size - document_count + 0.5) / (document_count + 0.5))
+                score += (
+                    idf
+                    * (frequency * (BM25_K1 + 1.0))
+                    / (frequency + BM25_K1 * (1.0 - BM25_B + BM25_B * length / average_length))
+                )
+            if score > 0.0:
+                scored.append((score, index))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        results = []
+        for score, index in scored[: max(1, int(limit))]:
+            metadata = metadatas[index] or {}
+            results.append(
+                {
+                    "text": documents[index],
+                    "source": metadata.get("source", "local document"),
+                    "path": metadata.get("path", ""),
+                    "distance": None,
+                    "bm25_score": round(score, 4),
+                }
+            )
+        return results
+
+    def retrieve(self, query, k=4, ef=None):
+        self._verify_embedding_dimension()
+        if ef is not None:
+            self._apply_search_ef(ef)
+        dense_chunks = self._dense_search(query, k)
+        if not HYBRID_RETRIEVAL:
+            return dense_chunks
+        try:
+            sparse_chunks = self._bm25_search(query, k * SPARSE_CANDIDATE_FACTOR)
+        except Exception:
+            sparse_chunks = []
+        if not sparse_chunks:
+            return dense_chunks
+        if not dense_chunks:
+            return sparse_chunks[:k]
+        return reciprocal_rank_fusion(dense_chunks, sparse_chunks, k)
