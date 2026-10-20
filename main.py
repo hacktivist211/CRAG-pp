@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+import threading
 import time
 
 from evaluator_router import (
@@ -16,10 +17,14 @@ from evaluator_router import (
 )
 from evaluator_router import CRAG_BACKEND, LLAMA_SERVER_URL
 from generator import backend_info, format_sources, generate_answer
+from memory_store import get_store
 from retrieval import HYBRID_RETRIEVAL, PERSIST_DIRECTORY, SEARCH_EF, VectorEngine
-from temporal_memory import MEMORY_DB_PATH, TemporalMemory
+from temporal_memory import MEMORY_DB_PATH, TemporalMemory, summarize_session
 
 TOP_K = 8
+SESSION_SUMMARY_EVERY_TURNS = 20
+SESSION_SUMMARY_AUTO_TIMEOUT = 30.0
+SESSION_SUMMARY_EXIT_TIMEOUT = 3.0
 
 BANNER = """
 ================================================================
@@ -72,6 +77,15 @@ PARAMETRIC_NOTICE = (
 
 def _log(message):
     print(f"[crag] {message}")
+
+
+def _safe_summarize(temporal, timeout=SESSION_SUMMARY_EXIT_TIMEOUT):
+    """Summarize without ever raising or delaying the goodbye message."""
+    try:
+        return summarize_session(temporal, get_store(), timeout=timeout)
+    except Exception as error:
+        print(f"[crag] session summary: skipped ({type(error).__name__}: {error})")
+        return None
 
 
 def _enable_ansi():
@@ -287,6 +301,21 @@ def run_crag_pipeline(query, engine, memory, top_k=TOP_K, ef=None, verbose=True)
         elapsed=time.time() - started,
     )
 
+    # Auto-flush: checkpoint long sessions without adding any turn latency.
+    if (
+        getattr(memory, "_session_turns", 0) > 0
+        and memory._session_turns % SESSION_SUMMARY_EVERY_TURNS == 0
+    ):
+        try:
+            threading.Thread(
+                target=_safe_summarize,
+                args=(memory, SESSION_SUMMARY_AUTO_TIMEOUT),
+                daemon=True,
+                name="session-summary-auto",
+            ).start()
+        except Exception as error:
+            print(f"[crag] session summary: skipped ({type(error).__name__}: {error})")
+
     elapsed = time.time() - started
     if verbose:
         print()
@@ -390,12 +419,14 @@ def main():
             print()
             query = input("You: ").strip()
         except (EOFError, KeyboardInterrupt):
+            _safe_summarize(memory)
             print("\nIRIS: goodbye.")
             break
         if not query:
             continue
         lowered = query.lower()
         if lowered in {"exit", "quit", "/exit", "/quit", "bye"}:
+            _safe_summarize(memory)
             print("IRIS: goodbye.")
             break
         if lowered == "/menu":

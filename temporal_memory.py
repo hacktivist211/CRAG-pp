@@ -24,6 +24,7 @@ import shutil
 import sqlite3
 import textwrap
 import threading
+import time
 import uuid
 
 # Store identity (see iris_config.py MEMORY MAP for the project-wide picture):
@@ -84,6 +85,49 @@ RECENCY_HALF_LIFE_DAYS = _env_float("CRAG_RECENCY_HALF_LIFE_DAYS", 14.0)
 MEMORY_MIN_SCORE = _env_float("CRAG_MEMORY_MIN_SCORE", 0.32)
 VISUAL_ARCHIVE_ENABLED = (
     os.getenv("CRAG_VISUAL_ARCHIVE", "1").strip().lower() not in ("0", "false", "off", "no")
+)
+
+# End-of-session summarization: one compact LLM call turns a session's episodic
+# turns into durable, extractive facts in memory.db. Disabled entirely with
+# CRAG_SESSION_SUMMARY_ENABLED=0; short sessions are skipped by default.
+SESSION_SUMMARY_ENABLED = (
+    os.getenv("CRAG_SESSION_SUMMARY_ENABLED", "1").strip().lower()
+    not in ("0", "false", "off", "no")
+)
+SESSION_SUMMARY_MIN_TURNS = _env_int("CRAG_SESSION_SUMMARY_MIN_TURNS", 5)
+SESSION_SUMMARY_MAX_TOKENS = 600
+SESSION_SUMMARY_TEMPERATURE = 0.2
+SESSION_SUMMARY_TIMEOUT = 3.0
+SESSION_SUMMARY_TRANSCRIPT_CHARS = 12000
+
+SESSION_SUMMARY_SYSTEM_PROMPT = (
+    "You extract durable facts from one conversation session for long-term memory. "
+    "Return strict JSON only, exactly in this shape: "
+    '{"facts": [{"topic": "short_topic", "fact": "one self-contained sentence", '
+    '"importance": 0.8}], "narrative": "two or three sentence summary"} '
+    "Rules: "
+    "(1) Extractive discipline: every fact must quote or closely paraphrase the user's own words, "
+    "or name an entity (product, place, number, date, decision) that appears verbatim in the "
+    "transcript. Reject abstractive generalities. "
+    "(2) One fact per row: do not merge independent facts. "
+    "(3) Every fact must be self-contained and understandable without the rest of the session. "
+    "(4) importance is a number in [0.1, 1.0]; decisions and preferences rank higher than "
+    "observations. "
+    "(5) Skip chit-chat, greetings, retries. Only durable details. "
+    '(6) Empty is allowed: if the session contained only casual conversation, return '
+    '{"facts": [], "narrative": ""}. Do not invent facts. '
+    "(7) Never infer beyond the transcript: if the user said 'I have 6 GB of VRAM' but did not "
+    "name the GPU model, do not add one. "
+    "Answer immediately with the JSON object only, no markdown fences and no explanation."
+)
+
+SESSION_SUMMARY_TEXT_SYSTEM_PROMPT = (
+    "You extract durable facts from one conversation session. "
+    "Reply with plain text only, one fact per line, in exactly this pipe-delimited format: "
+    "topic | fact | importance "
+    "Use the same extractive rules: quote or closely paraphrase the user's own words, name only "
+    "entities that appear verbatim in the transcript, keep one fact per line, skip chit-chat, "
+    "and never invent details. If there is nothing durable, reply with the single word none."
 )
 
 TURN_SNIPPET_CHARS = 400
@@ -720,3 +764,348 @@ class TemporalMemory:
             "db_bytes": db_bytes,
             "visual_files": visual_files,
         }
+
+
+# ------------------------------------------------------- session summarization
+
+
+def _summary_session_rows(temporal, session_id):
+    """Read this session's turns directly from the episodic log (never mutate it)."""
+    try:
+        cursor = temporal._conn.execute(
+            "SELECT turn_no, ts_local, query, answer FROM turns "
+            "WHERE session_id = ? ORDER BY id",
+            (session_id,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+    except Exception:
+        return []
+
+
+def _summary_transcript(rows, max_chars=SESSION_SUMMARY_TRANSCRIPT_CHARS):
+    """Compact, bounded transcript for the summarizer prompt (never printed)."""
+    lines = []
+    used = 0
+    for row in rows:
+        query = _collapse(row.get("query"))[:800]
+        answer = _collapse(row.get("answer"))[:600]
+        turn_no = row.get("turn_no")
+        block = f"[{turn_no}] User: {query}"
+        if answer:
+            block += f"\n    IRIS: {answer}"
+        if used + len(block) + 1 > max_chars:
+            break
+        lines.append(block)
+        used += len(block) + 1
+    return "\n".join(lines)
+
+
+def _summary_already_done(memory, session_id):
+    """Idempotency check against memory.db, with no LLM involvement."""
+    try:
+        row = memory.db.execute(
+            "SELECT 1 FROM memories WHERE kind = ? AND tags LIKE ? LIMIT 1",
+            ("session_summary_done", f"%{session_id}%"),
+        ).fetchone()
+        return bool(row)
+    except Exception:
+        return False
+
+
+def _summary_safe_add(memory, **kwargs):
+    """memory.add() that degrades to an embedding-free write and never raises."""
+    try:
+        return memory.add(**kwargs)
+    except Exception:
+        if kwargs.get("embed") is False:
+            return None
+        retry = dict(kwargs)
+        retry["embed"] = False
+        try:
+            return memory.add(**retry)
+        except Exception:
+            return None
+
+
+def _summary_mark_done(memory, session_id):
+    return _summary_safe_add(
+        memory,
+        content=f"Session {session_id} summarized.",
+        speaker="user",
+        source="session_auto",
+        kind="session_summary_done",
+        importance=0.1,
+        tags=f"session_id:{session_id}",
+        embed=False,
+    )
+
+
+def _summary_parse_json(raw):
+    """Parse the strict JSON response, tolerating code fences around it."""
+    text = (raw or "").strip()
+    if not text:
+        return None
+    if text.startswith("```"):
+        text = "\n".join(
+            line for line in text.splitlines() if not line.strip().startswith("```")
+        ).strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        data = json.loads(text[start:end + 1])
+    except (TypeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _summary_importance(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = 0.5
+    return max(0.1, min(1.0, number))
+
+
+def _summary_normalize(data):
+    """Return ([(topic, fact, importance)], narrative) from a JSON object."""
+    facts = []
+    entries = data.get("facts") if isinstance(data, dict) else None
+    if isinstance(entries, list):
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            content = entry.get("fact") or entry.get("content") or ""
+            if not isinstance(content, str):
+                continue
+            content = _collapse(content)
+            if not content:
+                continue
+            topic = entry.get("topic")
+            topic = _collapse(topic) if isinstance(topic, str) else ""
+            facts.append((topic, content, _summary_importance(entry.get("importance"))))
+    narrative = data.get("narrative") if isinstance(data, dict) else ""
+    narrative = _collapse(narrative) if isinstance(narrative, str) else ""
+    return facts, narrative
+
+
+def _summary_parse_lines(raw):
+    """Parse the plain-text fallback. Returns facts, or None if malformed."""
+    text = (raw or "").strip()
+    if not text:
+        return None
+    facts = []
+    for line in text.splitlines():
+        line = line.strip().lstrip("-* ").strip()
+        if not line:
+            continue
+        if line.lower() == "none":
+            continue
+        if "|" not in line:
+            return None
+        parts = [part.strip() for part in line.split("|")]
+        if len(parts) < 2 or not parts[1]:
+            return None
+        topic = parts[0]
+        importance = parts[2] if len(parts) > 2 else "0.5"
+        facts.append((topic, _collapse(parts[1]), _summary_importance(importance)))
+    return facts
+
+
+def _summary_control_call(messages, json_mode, num_predict, deadline):
+    """Call the shared LLM transport in a daemon thread with a wall-clock cap.
+
+    Returns (raw_text, error). A timed-out call leaves its daemon thread behind
+    but never blocks the caller (shutdown path) beyond the deadline.
+    """
+    import evaluator_router
+
+    call_kwargs = {"json_mode": json_mode, "num_predict": num_predict}
+    # The shared transport predates this feature and pins temperature 0.0.
+    # Forward the requested sampling temperature only when a transport accepts
+    # it; never modify evaluator_router itself.
+    try:
+        import inspect
+
+        if "temperature" in inspect.signature(
+            evaluator_router._control_complete
+        ).parameters:
+            call_kwargs["temperature"] = SESSION_SUMMARY_TEMPERATURE
+    except (TypeError, ValueError):
+        pass
+
+    outcome = {}
+
+    def worker():
+        try:
+            outcome["raw"] = evaluator_router._control_complete(
+                messages, **call_kwargs
+            )
+        except Exception as error:  # never let a transport error escape the thread
+            outcome["error"] = error
+
+    thread = threading.Thread(
+        target=worker, daemon=True, name="session-summary-llm"
+    )
+    thread.start()
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return "", TimeoutError("session summary deadline already elapsed")
+    thread.join(remaining)
+    if thread.is_alive():
+        return "", TimeoutError(
+            f"LLM call exceeded the {max(0.0, remaining):.1f}s remaining cap"
+        )
+    error = outcome.get("error")
+    if error is not None:
+        return "", error
+    return outcome.get("raw") or "", None
+
+
+def summarize_session(temporal, memory, min_turns=SESSION_SUMMARY_MIN_TURNS,
+                      force=False, timeout=SESSION_SUMMARY_TIMEOUT):
+    """Summarize one session into durable facts + one narrative row.
+
+    Extractive by contract: the LLM is instructed to quote the user's own words
+    or named entities, but this function only persists what it returns. Facts go
+    to memory.db with source="session_auto", kind="session_summary"; the narrative
+    uses kind="session_narrative". A session_summary_done bookkeeping row makes
+    the pass idempotent per session_id. Every failure degrades to a status dict;
+    this function never raises into main.py.
+    """
+    started = time.monotonic()
+    session_id = str(getattr(temporal, "session_id", "") or "")
+
+    def finish(status, facts_saved=0, narrative_saved=False, error=None):
+        result = {
+            "status": status,
+            "facts_saved": int(facts_saved),
+            "narrative_saved": bool(narrative_saved),
+            "session_id": session_id,
+            "elapsed_ms": (time.monotonic() - started) * 1000.0,
+            "error": error,
+        }
+        if status != "ok":
+            print(f"[crag] session summary: {status} ({error or 'no reason'})")
+        return result
+
+    if not SESSION_SUMMARY_ENABLED:
+        return finish("skipped", error="disabled by CRAG_SESSION_SUMMARY_ENABLED")
+    if temporal is None or not session_id:
+        return finish("no_session", error="no active session")
+
+    try:
+        minimum = max(1, int(min_turns))
+    except (TypeError, ValueError):
+        minimum = SESSION_SUMMARY_MIN_TURNS
+
+    rows = _summary_session_rows(temporal, session_id)
+    if not rows:
+        return finish("no_session", error="no turns in the current session")
+    if len(rows) < minimum:
+        return finish(
+            "skipped", error=f"{len(rows)} turn(s) < min_turns={minimum}"
+        )
+    if not force and memory is not None and _summary_already_done(memory, session_id):
+        return finish("already_summarized", error=f"session {session_id} already summarized")
+
+    transcript = _summary_transcript(rows)
+    if not transcript:
+        return finish("skipped", error="empty transcript")
+
+    try:
+        cap = max(0.1, float(timeout))
+    except (TypeError, ValueError):
+        cap = SESSION_SUMMARY_TIMEOUT
+    deadline = started + cap
+
+    messages = [
+        ("system", SESSION_SUMMARY_SYSTEM_PROMPT),
+        (
+            "user",
+            "Transcript of the current session:\n\n"
+            f"{transcript}\n\n"
+            "Extract the durable facts and the narrative. JSON only.",
+        ),
+    ]
+    try:
+        raw, error = _summary_control_call(
+            messages, json_mode=True, num_predict=SESSION_SUMMARY_MAX_TOKENS,
+            deadline=deadline,
+        )
+    except Exception as failure:
+        return finish("llm_failed", error=f"{type(failure).__name__}: {failure}")
+    if error is not None:
+        return finish(
+            "llm_failed", error=f"{type(error).__name__}: {error}"
+        )
+    if not (raw or "").strip():
+        return finish("llm_failed", error="empty response from LLM")
+
+    data = _summary_parse_json(raw)
+    if data is None:
+        # One text fallback, same deadline: ask for plain pipe-delimited lines.
+        fallback_messages = [
+            ("system", SESSION_SUMMARY_TEXT_SYSTEM_PROMPT),
+            (
+                "user",
+                "Transcript of the current session:\n\n"
+                f"{transcript}\n\n"
+                "Return one durable fact per line as: topic | fact | importance",
+            ),
+        ]
+        try:
+            raw_two, error_two = _summary_control_call(
+                fallback_messages, json_mode=False,
+                num_predict=SESSION_SUMMARY_MAX_TOKENS, deadline=deadline,
+            )
+        except Exception as failure:
+            return finish(
+                "llm_failed",
+                error=f"text fallback failed: {type(failure).__name__}: {failure}",
+            )
+        if error_two is not None:
+            return finish(
+                "llm_failed",
+                error=f"text fallback failed: {type(error_two).__name__}: {error_two}",
+            )
+        fallback_facts = _summary_parse_lines(raw_two)
+        if fallback_facts is None:
+            return finish(
+                "llm_failed",
+                error="LLM did not return valid JSON or plain fact lines",
+            )
+        facts, narrative = fallback_facts, ""
+    else:
+        facts, narrative = _summary_normalize(data)
+
+    saved = 0
+    for _topic, content, importance in facts:
+        row_id = _summary_safe_add(
+            memory,
+            content=content,
+            speaker="user",
+            source="session_auto",
+            kind="session_summary",
+            importance=importance,
+        )
+        if row_id is not None:
+            saved += 1
+
+    narrative_saved = False
+    if narrative:
+        row_id = _summary_safe_add(
+            memory,
+            content=narrative,
+            speaker="user",
+            source="session_auto",
+            kind="session_narrative",
+            importance=0.6,
+        )
+        narrative_saved = row_id is not None
+
+    if memory is not None:
+        _summary_mark_done(memory, session_id)
+
+    return finish("ok", facts_saved=saved, narrative_saved=narrative_saved)
