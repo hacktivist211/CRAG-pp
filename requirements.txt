@@ -1,17 +1,44 @@
+# ============================================================================
+# modern-crag — Self-Corrective RAG (retrieval + grading + refinement +
+# Tavily/DDG web fallback + temporal memory). No STT, no TTS, no mic.
+# Python 3.11, CUDA 12.4 (replace torch with the CPU wheel if no GPU).
+# ============================================================================
+
 --extra-index-url https://download.pytorch.org/whl/cu124
+
+# ---- PyTorch (needed by sentence-transformers for bge-m3) ------------------
 torch==2.6.0+cu124
+
+# ---- Transformers / embedding backbone ------------------------------------
+transformers>=4.45,<6
+sentencepiece>=0.1.99,<0.2
+safetensors>=0.4,<1
+
+# ---- Embeddings ------------------------------------------------------------
+sentence-transformers>=3.0,<6
 numpy>=1.26.4,<2.0
-sentence-transformers>=3.3,<6
-transformers>=4.44,<5
+
+# ---- Web search fallback ---------------------------------------------------
+tavily-python>=0.5,<1
+ddgs>=9
+duckduckgo-search>=6.3,<9
+
+# ---- Vector store / document loaders --------------------------------------
 langchain>=0.3.14,<0.4
 langchain-core>=0.3.29,<0.4
 langchain-community>=0.3,<0.4
 langchain-text-splitters>=0.3,<0.4
 langchain-chroma>=0.2,<0.3
-langchain-ollama>=0.2,<0.4
 chromadb>=0.5.18,<0.6
 posthog>=2.4,<3
 pymupdf>=1.24,<2
-duckduckgo-search>=6.3,<7
-rich>=13.7,<15
+
+# ---- Utilities -------------------------------------------------------------
+requests>=2.31,<3
+urllib3>=2.0,<3
+pyarrow>=14.0.0
 chardet>=5.2,<6
+pillow>=10.0,<12
+rich>=13.7,<15
+pydantic>=2.5,<3
+tqdm>=4.66,<5
