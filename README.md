@@ -5,7 +5,7 @@ are, and if they are not good enough, it searches the web instead. Then it
 writes an answer that stays grounded in whatever it actually found.
 
 It runs on the same local `llama-server` as the
-[ULTRON voice assistant](https://github.com/hacktivist211/tts_loop_agent).
+[ULTRON voice assistant](https://github.com/hacktivist211/ULTRON).
 No second model, no extra GPU memory, no Ollama.
 
 It also remembers past conversations, so you can ask "what did we talk about
@@ -20,7 +20,7 @@ last Tuesday" and get a real answer with a timestamp.
 pip install -r requirements.txt
 
 # 2. start llama-server somewhere (shared with the voice stack):
-#    ./start_llama.sh    from the tts_loop_agent repo
+#    ./start_llama.sh    from the ULTRON repo
 
 # 3. point CRAG++ at it
 echo 'LLAMA_SERVER_URL=http://127.0.0.1:8080' > .env
@@ -385,7 +385,7 @@ warning, one friendly error, and returns to the prompt. It does not crash.
 ## 12. Relation to ULTRON
 
 CRAG++ shares eleven files with the
-[`tts_loop_agent`](https://github.com/hacktivist211/tts_loop_agent) repo:
+[`ULTRON`](https://github.com/hacktivist211/ULTRON) repo:
 
 `iris_config.py`, `tool_runtime.py`, `temporal_memory.py`, `tavily_tool.py`,
 `memory_store.py`, `memory_import.py`, `evaluator_router.py`, `generator.py`,
